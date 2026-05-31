@@ -27,6 +27,7 @@ let obiHistory = [];
 let recentCandles = [];
 let tickBuffer = [];
 let isInsertingCandle = false;
+let activeTradeStream = 'none';
 
 function calcOBI(b, a) {
   const bv = b.reduce((s, [, q]) => s + parseFloat(q), 0);
@@ -144,7 +145,7 @@ async function sealCandle() {
 
     const { error } = await supabase.from('candles').insert(sealed);
     if (error) console.error('Candle insert error:', error.message);
-    else console.log(`Candle #${candleCount} sealed | close=${sealed.close} | delta=${sealed.delta.toFixed(4)} | consensus=${sealed.consensus} | ticks=${totalTicks}`);
+    else console.log(`Candle #${candleCount} sealed | close=${sealed.close} | delta=${sealed.delta.toFixed(4)} | consensus=${sealed.consensus} | stream=${activeTradeStream}`);
 
     if (tickBuffer.length > 0) {
       const toInsert = tickBuffer.splice(0, tickBuffer.length);
@@ -168,15 +169,12 @@ async function sealCandle() {
 function processTick(price, qty, isBuyerMaker, timestamp) {
   totalTicks++;
   if (totalTicks % 100 === 0) {
-    console.log(`Ticks processed: ${totalTicks} | cum_delta: ${cumulativeDelta.toFixed(4)} | candles: ${candleCount} | current_vol: ${currentCandle ? currentCandle.volume.toFixed(4) : 0}`);
+    console.log(`Ticks: ${totalTicks} | cum_delta: ${cumulativeDelta.toFixed(4)} | candles: ${candleCount} | vol: ${currentCandle ? currentCandle.volume.toFixed(4) : 0} | stream: ${activeTradeStream}`);
   }
-
   const aggressiveBuy = !isBuyerMaker;
   if (aggressiveBuy) cumulativeDelta += qty;
   else cumulativeDelta -= qty;
-
   tickBuffer.push({ t: timestamp, p: price, q: qty, m: isBuyerMaker });
-
   if (!currentCandle) {
     currentCandle = {
       tsOpen: timestamp, open: price, high: price,
@@ -184,7 +182,6 @@ function processTick(price, qty, isBuyerMaker, timestamp) {
       volume: 0, buyVol: 0, sellVol: 0, tradeCount: 0
     };
   }
-
   currentCandle.high = Math.max(currentCandle.high, price);
   currentCandle.low = Math.min(currentCandle.low, price);
   currentCandle.close = price;
@@ -192,9 +189,25 @@ function processTick(price, qty, isBuyerMaker, timestamp) {
   currentCandle.tradeCount++;
   if (aggressiveBuy) currentCandle.buyVol += qty;
   else currentCandle.sellVol += qty;
-
   if (currentCandle.volume >= CANDLE_SIZE_BTC) {
     sealCandle();
+  }
+}
+
+function handleTradeMessage(data, streamName) {
+  try {
+    const raw = data.toString();
+    const t = JSON.parse(raw);
+    const price = parseFloat(t.p);
+    const qty = parseFloat(t.q);
+    if (price > 0 && qty > 0) {
+      activeTradeStream = streamName;
+      processTick(price, qty, t.m, t.T);
+    } else {
+      console.log('Invalid tick from', streamName, raw.slice(0, 80));
+    }
+  } catch (e) {
+    console.error('Parse error from', streamName, e.message);
   }
 }
 
@@ -219,13 +232,14 @@ app.get('/latest', (req, res) => {
     cum_delta: cumulativeDelta,
     candle_count: candleCount,
     total_ticks: totalTicks,
+    active_stream: activeTradeStream,
     order_book: { bids: bids.slice(0, 10), asks: asks.slice(0, 10) },
     recent_candles: recentCandles.slice(-10)
   });
 });
 
 app.get('/health', (req, res) => {
-  res.json({ status: 'ok', candles: candleCount, cum_delta: cumulativeDelta, ticks: totalTicks });
+  res.json({ status: 'ok', candles: candleCount, cum_delta: cumulativeDelta, ticks: totalTicks, stream: activeTradeStream });
 });
 
 const PORT = process.env.PORT || 3000;
@@ -247,28 +261,91 @@ function connectBook() {
   ws.on('error', (e) => { console.error('Book error:', e.message); ws.terminate(); setTimeout(connectBook, 3000); });
 }
 
-function connectTrades() {
-  const ws = new WebSocket('wss://fstream.binance.com/ws/' + SYMBOL + '@aggTrade');
-  ws.on('open', () => console.log('Trade stream connected'));
+function connectFuturesTrades() {
+  const endpoints = [
+    'wss://fstream.binance.com/ws/' + SYMBOL + '@aggTrade',
+    'wss://fstream1.binance.com/ws/' + SYMBOL + '@aggTrade',
+    'wss://fstream2.binance.com/ws/' + SYMBOL + '@aggTrade',
+    'wss://fstream3.binance.com/ws/' + SYMBOL + '@aggTrade',
+  ];
+  let idx = 0;
+
+  function tryNext() {
+    const url = endpoints[idx % endpoints.length];
+    idx++;
+    console.log('Trying futures endpoint:', url);
+    const ws = new WebSocket(url);
+    let count = 0;
+
+    const timer = setTimeout(() => {
+      if (count === 0) {
+        console.log('No data from', url, '— trying next endpoint');
+        ws.terminate();
+        tryNext();
+      }
+    }, 8000);
+
+    ws.on('open', () => console.log('Futures trade stream opened:', url));
+    ws.on('message', (data) => {
+      count++;
+      if (count === 1) { console.log('SUCCESS: Futures ticks flowing from', url); clearTimeout(timer); }
+      handleTradeMessage(data, 'futures:' + url.split('/')[2]);
+    });
+    ws.on('close', () => { clearTimeout(timer); if (count > 0) { console.log('Futures stream closed, reconnecting...'); setTimeout(() => connectFuturesTrades(), 3000); } });
+    ws.on('error', (e) => { clearTimeout(timer); console.error('Futures stream error:', e.message); ws.terminate(); setTimeout(tryNext, 2000); });
+  }
+
+  tryNext();
+}
+
+function connectSpotTrades() {
+  console.log('Starting spot trade stream fallback...');
+  const ws = new WebSocket('wss://stream.binance.com:9443/ws/' + SYMBOL + '@aggTrade');
+  let count = 0;
+  ws.on('open', () => console.log('Spot trade stream opened'));
+  ws.on('message', (data) => {
+    count++;
+    if (count === 1) console.log('SUCCESS: Spot ticks flowing');
+    handleTradeMessage(data, 'spot');
+  });
+  ws.on('close', () => { console.log('Spot stream closed, reconnecting...'); setTimeout(connectSpotTrades, 3000); });
+  ws.on('error', (e) => { console.error('Spot stream error:', e.message); ws.terminate(); setTimeout(connectSpotTrades, 3000); });
+}
+
+function connectBybitTrades() {
+  console.log('Starting Bybit trade stream fallback...');
+  const ws = new WebSocket('wss://stream.bybit.com/v5/public/linear');
+  let count = 0;
+  ws.on('open', () => {
+    console.log('Bybit stream opened, subscribing...');
+    ws.send(JSON.stringify({ op: 'subscribe', args: ['publicTrade.BTCUSDT'] }));
+  });
   ws.on('message', (data) => {
     try {
-      const raw = data.toString();
-      const t = JSON.parse(raw);
-      const price = parseFloat(t.p);
-      const qty = parseFloat(t.q);
-      if (price > 0 && qty > 0) {
-        processTick(price, qty, t.m, t.T);
-      } else {
-        console.log('Invalid tick:', raw.slice(0, 100));
+      const msg = JSON.parse(data.toString());
+      if (msg.topic && msg.data) {
+        msg.data.forEach(t => {
+          const price = parseFloat(t.p);
+          const qty = parseFloat(t.v);
+          const isBuyerMaker = t.S === 'Sell';
+          if (price > 0 && qty > 0) {
+            count++;
+            if (count === 1) console.log('SUCCESS: Bybit ticks flowing');
+            activeTradeStream = 'bybit';
+            processTick(price, qty, isBuyerMaker, t.T);
+          }
+        });
       }
-    } catch (e) {
-      console.error('Trade parse error:', e.message);
-    }
+    } catch (e) { console.error('Bybit parse error:', e.message); }
   });
-  ws.on('close', () => { console.log('Trades closed, reconnecting...'); setTimeout(connectTrades, 3000); });
-  ws.on('error', (e) => { console.error('Trade error:', e.message); ws.terminate(); setTimeout(connectTrades, 3000); });
+  ws.on('close', () => { console.log('Bybit stream closed, reconnecting...'); setTimeout(connectBybitTrades, 3000); });
+  ws.on('error', (e) => { console.error('Bybit stream error:', e.message); ws.terminate(); setTimeout(connectBybitTrades, 3000); });
 }
 
 connectBook();
-connectTrades();
+connectFuturesTrades();
+setTimeout(connectSpotTrades, 10000);
+setTimeout(connectBybitTrades, 20000);
+
 console.log('BTC Order Flow server starting...');
+console.log('Will try: Binance futures → Binance spot → Bybit');
